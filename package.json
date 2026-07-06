@@ -1,6 +1,6 @@
 {
   "name": "cronhost",
-  "version": "1.0.4",
+  "version": "2.0.0",
   "description": "Official TypeScript SDK for Cronhost - schedule HTTP requests with cron expressions",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -10,6 +10,7 @@
   ],
   "scripts": {
     "build": "tsc",
+    "smoke": "bun run scripts/smoke-test.ts",
     "prepublishOnly": "npm run build"
   },
   "keywords": [

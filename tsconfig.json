@@ -23,5 +23,8 @@
     "noUnusedLocals": false,
     "noUnusedParameters": false,
     "noPropertyAccessFromIndexSignature": false
-  }
+  },
+  // Only the entrypoint is compiled into the published package. Dev scripts
+  // (e.g. scripts/smoke-test.ts) are typechecked separately.
+  "include": ["index.ts"]
 }

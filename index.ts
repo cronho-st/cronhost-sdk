@@ -3,6 +3,10 @@ export interface CronhostConfig {
   baseUrl?: string;
 }
 
+export type HttpMethod = "GET" | "POST" | "PUT" | "DELETE" | "PATCH";
+
+export type JobStatus = "PENDING" | "RUNNING" | "SUCCESS" | "FAILED";
+
 export interface Schedule {
   id: string;
   name: string;
@@ -10,7 +14,7 @@ export interface Schedule {
   cronExpression: string;
   timezone: string;
   endpoint: string;
-  httpMethod: "GET" | "POST" | "PUT" | "DELETE" | "PATCH";
+  httpMethod: HttpMethod;
   body?: string;
   headers?: string;
   isEnabled: boolean;
@@ -20,15 +24,18 @@ export interface Schedule {
   updatedAt: Date;
   maxRetries: number;
   timeoutSeconds: number;
+  // Comma-separated 3-digit codes/ranges (e.g. "200-299,410"). When null the
+  // schedule uses the default success rule (status < 400).
+  expectedStatusCodes?: string | null;
 }
 
 export interface Job {
   id: string;
   scheduleId: string;
-  status: "PENDING" | "RUNNING" | "SUCCESS" | "FAILED";
+  status: JobStatus;
   scheduledRunAtUtc: Date;
   attemptNumber: number;
-  httpMethod: "GET" | "POST" | "PUT" | "DELETE" | "PATCH";
+  httpMethod: HttpMethod;
   endpoint: string;
   body?: string;
   headers?: string;
@@ -47,11 +54,16 @@ export interface CreateScheduleData {
   cronExpression: string;
   timezone: string;
   endpoint: string;
-  httpMethod: "GET" | "POST" | "PUT" | "DELETE" | "PATCH";
+  httpMethod: HttpMethod;
   body?: string;
   headers?: Record<string, string>;
+  // Total attempts including the first, clamped to 1-10 (0 becomes 1).
   maxRetries?: number;
+  // Per-request timeout, clamped to 1-300 seconds.
   timeoutSeconds?: number;
+  // Codes counted as success (e.g. "200-299,410"). Omit or blank for the
+  // default rule (status < 400).
+  expectedStatusCodes?: string;
 }
 
 export interface UpdateScheduleData {
@@ -60,18 +72,90 @@ export interface UpdateScheduleData {
   cronExpression?: string;
   timezone?: string;
   endpoint?: string;
-  httpMethod?: "GET" | "POST" | "PUT" | "DELETE" | "PATCH";
+  httpMethod?: HttpMethod;
   body?: string;
   headers?: Record<string, string>;
   maxRetries?: number;
   timeoutSeconds?: number;
+  // Pass "" to clear back to the default success rule.
+  expectedStatusCodes?: string;
 }
 
 export interface GetJobsParams {
-  scheduleId?: string;
-  status?: "PENDING" | "RUNNING" | "SUCCESS" | "FAILED";
+  // Required: the jobs list is always scoped to a single schedule.
+  scheduleId: string;
+  status?: JobStatus;
+  // 1-based page number.
   page?: number;
-  limit?: number;
+  pageSize?: number;
+}
+
+export interface JobsPage {
+  jobs: Job[];
+  page: number;
+  pageSize: number;
+  totalPages: number;
+  total: number;
+}
+
+export type NotificationChannelType = "email" | "slack" | "discord" | "telegram";
+
+export type NotifyOn = "none" | "success" | "failure" | "both";
+
+// Non-secret view of a channel. Config secrets (webhook URLs, bot tokens) are
+// never returned by the API.
+export interface NotificationChannel {
+  id: string;
+  type: NotificationChannelType;
+  verified: boolean;
+  label: string;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+export interface EmailChannelConfig {
+  to: string;
+}
+
+export interface WebhookChannelConfig {
+  webhookUrl: string;
+}
+
+export interface TelegramChannelConfig {
+  botToken: string;
+  chatId?: string;
+}
+
+export type CreateNotificationChannelData =
+  | { type: "email"; label: string; config: EmailChannelConfig }
+  | { type: "slack"; label: string; config: WebhookChannelConfig }
+  | { type: "discord"; label: string; config: WebhookChannelConfig }
+  | { type: "telegram"; label: string; config: TelegramChannelConfig };
+
+// `type` is immutable; only the label and/or config can change.
+export interface UpdateNotificationChannelData {
+  label?: string;
+  config?: Record<string, unknown>;
+}
+
+export interface PreferenceChannelRef {
+  channelId: string;
+  type: NotificationChannelType;
+  label: string;
+  verified: boolean;
+}
+
+export interface ScheduleNotificationPreference {
+  scheduleId: string;
+  notifyOn: NotifyOn;
+  channels: PreferenceChannelRef[];
+  warning?: string | null;
+}
+
+export interface SetScheduleNotificationData {
+  notifyOn: NotifyOn;
+  // Verified channel ids to attach. Required when notifyOn is not "none".
+  channelIds?: string[];
 }
 
 export interface ApiResponse<T> {
@@ -273,8 +357,9 @@ export class Cronhost {
     });
   }
 
-  async triggerSchedule(id: string): Promise<Job> {
-    const response = await this.request<ApiResponse<Job>>(
+  // Returns the id of the created job. Fetch its details with getJob(id).
+  async triggerSchedule(id: string): Promise<string> {
+    const response = await this.request<ApiResponse<string>>(
       `/schedules/${id}/trigger`,
       {
         method: "POST",
@@ -295,23 +380,107 @@ export class Cronhost {
   }
 
   // Job methods
-  async getJobs(params: GetJobsParams = {}): Promise<Job[]> {
-    const searchParams = new URLSearchParams();
+  async getJobs(params: GetJobsParams): Promise<JobsPage> {
+    if (!params.scheduleId) {
+      throw new Error("scheduleId is required to list jobs");
+    }
 
-    if (params.scheduleId) searchParams.set("scheduleId", params.scheduleId);
+    const searchParams = new URLSearchParams();
+    searchParams.set("scheduleId", params.scheduleId);
     if (params.status) searchParams.set("status", params.status);
     if (params.page) searchParams.set("page", params.page.toString());
-    if (params.limit) searchParams.set("limit", params.limit.toString());
+    if (params.pageSize) searchParams.set("pageSize", params.pageSize.toString());
 
-    const queryString = searchParams.toString();
-    const endpoint = queryString ? `/jobs?${queryString}` : "/jobs";
-
-    const response = await this.request<ApiResponse<Job[]>>(endpoint);
+    const response = await this.request<ApiResponse<JobsPage>>(
+      `/jobs?${searchParams.toString()}`
+    );
     return response.data;
   }
 
   async getJob(id: string): Promise<Job> {
     const response = await this.request<ApiResponse<Job>>(`/jobs/${id}`);
+    return response.data;
+  }
+
+  // Notification channel methods
+  async listNotificationChannels(): Promise<NotificationChannel[]> {
+    const response = await this.request<ApiResponse<NotificationChannel[]>>(
+      "/notification-channels"
+    );
+    return response.data;
+  }
+
+  async createNotificationChannel(
+    data: CreateNotificationChannelData
+  ): Promise<NotificationChannel> {
+    const response = await this.request<ApiResponse<NotificationChannel>>(
+      "/notification-channels",
+      {
+        method: "POST",
+        body: JSON.stringify(data),
+      }
+    );
+    return response.data;
+  }
+
+  async getNotificationChannel(id: string): Promise<NotificationChannel> {
+    const response = await this.request<ApiResponse<NotificationChannel>>(
+      `/notification-channels/${id}`
+    );
+    return response.data;
+  }
+
+  async updateNotificationChannel(
+    id: string,
+    data: UpdateNotificationChannelData
+  ): Promise<NotificationChannel> {
+    const response = await this.request<ApiResponse<NotificationChannel>>(
+      `/notification-channels/${id}`,
+      {
+        method: "PATCH",
+        body: JSON.stringify(data),
+      }
+    );
+    return response.data;
+  }
+
+  async deleteNotificationChannel(id: string): Promise<void> {
+    await this.request(`/notification-channels/${id}`, {
+      method: "DELETE",
+    });
+  }
+
+  // Sends a test notification and marks the channel verified on success.
+  async verifyNotificationChannel(id: string): Promise<NotificationChannel> {
+    const response = await this.request<ApiResponse<NotificationChannel>>(
+      `/notification-channels/${id}/verify`,
+      {
+        method: "POST",
+      }
+    );
+    return response.data;
+  }
+
+  // Schedule notification preferences
+  async getScheduleNotifications(
+    scheduleId: string
+  ): Promise<ScheduleNotificationPreference> {
+    const response = await this.request<
+      ApiResponse<ScheduleNotificationPreference>
+    >(`/schedules/${scheduleId}/notifications`);
+    return response.data;
+  }
+
+  async setScheduleNotifications(
+    scheduleId: string,
+    data: SetScheduleNotificationData
+  ): Promise<ScheduleNotificationPreference> {
+    const response = await this.request<
+      ApiResponse<ScheduleNotificationPreference>
+    >(`/schedules/${scheduleId}/notifications`, {
+      method: "PUT",
+      body: JSON.stringify(data),
+    });
     return response.data;
   }
 }
